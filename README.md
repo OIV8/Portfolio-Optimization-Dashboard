@@ -11,11 +11,13 @@ An **interactive dashboard** for portfolio optimization strategies — from clas
   - Maximum Sharpe Ratio
   - Equal Weight
   - **Black-Litterman** (with custom absolute & relative views + confidence levels)
+  - **CVaR** (Rockafellar and Ursayev (2001))
 
-- 🧠 Investor view inputs (for Black-Litterman):
+- 🧠 Investor view inputs (for Black-Litterman and CVaR):
   - Absolute views (e.g., "AAPL will return 10%")
   - Relative views (e.g., "AAPL will outperform MSFT by 3%")
-  - Adjustable confidence levels for each view
+  - Adjustable confidence levels for each view and for CVaR
+
 
 - 📆 Historical portfolio performance plot
 - 📎 Benchmark comparison (e.g., SPY)
@@ -36,7 +38,8 @@ streamlit run stream.py
 
 ## 💡 To-Do 
 
-- [ ] CVaR Optimization (Historical + Monte Carlo)
+- [ ] Factor Exposure
+- [ ] Risk contribution
 - [ ] Sector / ESG filtering
 
 
