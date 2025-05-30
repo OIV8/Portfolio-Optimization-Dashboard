@@ -39,8 +39,8 @@ streamlit run stream.py
 
 ## 📸 Screenshots
 
-<img src="tab_optimize.png" width="800">
-<img src="tab_risk.png" width="800">
+<img src="screenshots/tab_optimize.png" width="800">
+<img src="screenshots/tab_risk.png" width="800">
 
 
 ## 💡 To-Do 
