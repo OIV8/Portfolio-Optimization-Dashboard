@@ -145,21 +145,12 @@ def optimize_portfolio(data, strategy, benchmark, views=None, alpha=0.95):
         raise ValueError("Invalid strategy")
 
     portfolio = pd.Series(weights, index=data.columns)
-    portfolio_returns = returns.dot(weights)  
-    sorted_returns = np.sort(portfolio_returns)
-    var_hist = -np.percentile(sorted_returns, 100 * (1 - alpha))
-    cvar_hist = -np.mean(sorted_returns[sorted_returns<=-var_hist])
-    sorted_returns_bench = np.sort(benchmark_returns)
-    var_hist_bench = -np.percentile(sorted_returns_bench, 100 * (1 - alpha))
-    cvar_hist_bench = -np.mean(sorted_returns_bench[sorted_returns_bench<=-var_hist_bench])
     stats = {
         "Expected Return": [np.dot(weights, mean_returns) * 252, np.mean(benchmark_returns) * 252],
         "Volatility": [np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)) * 252) , 
                        np.std(benchmark_returns.to_numpy())* np.sqrt(252)],
         "Sharpe Ratio": [(np.dot(weights, mean_returns) * 252) / np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)) * 252),
-                          np.mean(benchmark_returns) * 252/(np.std(benchmark_returns.to_numpy()) * np.sqrt(252))],
-        f"VaR {alpha * 100:.0f}%" : [var_hist * np.sqrt(252), var_hist_bench * np.sqrt(252)],
-        f"CVaR {alpha * 100:.0f}%" : [cvar_hist * np.sqrt(252), cvar_hist_bench * np.sqrt(252)]
+                          np.mean(benchmark_returns) * 252/(np.std(benchmark_returns.to_numpy()) * np.sqrt(252))]
     }
 
     return portfolio, stats
@@ -179,7 +170,7 @@ def plot_historic_perf(data, opt_weights, benchmark):
 
 def plot_drawdowns(data, opt_weights, benchmark):
     returns = data.pct_change().dropna()
-    portfolio_returns = (returns *  opt_weights).sum(1)
+    portfolio_returns = returns.dot(opt_weights)
     benchmark_returns = benchmark.pct_change().dropna()
 
     def calculate_drawdowns(returns):
@@ -207,4 +198,166 @@ def plot_correlation_heatmap(data):
     cm = sns.dark_palette("blue", as_cmap=True)
     corr_matrix = corr_matrix.style.format(precision = 3).background_gradient(cmap=cm)
     return corr_matrix
+
+#######################
+### Risks Functions ###
+#######################
+from copulae import StudentCopula
+from scipy.stats import t
+from arch import arch_model
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+def monte_carlo_simulation(data, opt_weights, num_days, num_simulations, initial_value, market_shocks, stock):
+    num_stocks = len(opt_weights)
+    log_returns = np.log(data / data.shift(1)).dropna()
+    garch_models = {}
+    standardized_residuals = np.zeros((len(log_returns), num_stocks))
+    conditional_volatilities = np.zeros((len(log_returns), num_stocks))
+    
+    for i in range(num_stocks):
+        col_name = log_returns.columns[i]
+        model = arch_model(
+            log_returns.iloc[:, i], 
+            mean='Zero', 
+            vol='GARCH', 
+            p=1, q=1, 
+            dist='studentst',
+            rescale=False,
+        ).fit(disp='off')
+        
+        garch_models[col_name] = model
+        standardized_residuals[:, i] = model.std_resid.values
+        conditional_volatilities[:, i] = model.conditional_volatility.values
+    
+    uniform_data = np.zeros_like(standardized_residuals)
+    for i in range(num_stocks):
+        col_name = log_returns.columns[i]
+        df_param = garch_models[col_name].params['nu']
+        uniform_data[:, i] = t.cdf(standardized_residuals[:, i], df=df_param)
+    
+    student_copula = StudentCopula(dim=num_stocks)
+    student_copula.fit(uniform_data)
+
+    forecasted_volatilities = np.zeros((num_days, num_stocks))
+    mean_returns = log_returns.mean().values
+    
+    for i in range(num_stocks):
+        col_name = log_returns.columns[i]
+        model = garch_models[col_name]
+        
+        # Forecast volatilities
+        forecasts = model.forecast(horizon=num_days, reindex=False)
+        forecasted_volatilities[:, i] = np.sqrt(forecasts.variance.values[-1])
+    
+    ### Monte Carlo simulation
+    simulated_portfolio_paths = np.zeros((num_simulations, num_days + 1))
+    simulated_portfolio_paths[:, 0] = initial_value
+    final_portfolio_values = np.zeros(num_simulations)
+    total_portfolio_returns = np.zeros(num_simulations)
+    
+    for s in range(num_simulations):
+
+        uniform_samples = student_copula.random(num_days)
+        standardized_innovations = np.zeros((num_days, num_stocks))
+        for i in range(num_stocks):
+            col_name = log_returns.columns[i]
+            df_param = garch_models[col_name].params['nu']
+            standardized_innovations[:, i] = t.ppf(uniform_samples[:, i], df=df_param)
+        
+        daily_log_returns = np.zeros((num_days, num_stocks))
+        for day in range(num_days):
+            for i in range(num_stocks):
+                daily_log_returns[day, i] = (
+                    mean_returns[i] + 
+                    forecasted_volatilities[day, i] * standardized_innovations[day, i]
+                )
+        
+        daily_arithmetic_returns = np.exp(daily_log_returns) - 1
+        daily_portfolio_returns = np.dot(daily_arithmetic_returns, opt_weights)
+        
+        for shock_day, shock_magnitude in market_shocks:
+            daily_portfolio_returns[shock_day] += shock_magnitude
+        
+        portfolio_value_path = np.zeros(num_days + 1)
+        portfolio_value_path[0] = initial_value
+        
+        for day in range(num_days):
+            portfolio_value_path[day + 1] = (
+                portfolio_value_path[day] * (1 + daily_portfolio_returns[day])
+            )
+        
+        simulated_portfolio_paths[s, :] = portfolio_value_path
+        final_portfolio_values[s] = portfolio_value_path[-1]
+        total_portfolio_returns[s] = (final_portfolio_values[s] - initial_value) / initial_value
+    
+        
+    # Plot Monte Carlo Results
+    figure = make_subplots(rows=1, cols=2,
+                            subplot_titles=('Portfolio Value Paths 100 Samples)','Total Value Distribution'),
+                            shared_yaxes=True, horizontal_spacing = 0, column_widths=[3,1])
+    sample_paths = simulated_portfolio_paths[:100] 
+    time_ax = pd.date_range(start=data.index[-1] , periods=num_days + 1, freq='B')
+    for i, path in enumerate(sample_paths):
+        figure.add_trace(go.Scatter(x=time_ax, y=path, mode='lines', 
+                    showlegend=False, opacity=0.3),
+                    row = 1, col=1)
+    figure.add_trace(go.Histogram(y=final_portfolio_values[:100],orientation='h', nbinsy=25, 
+                    name='Final Values', showlegend=False ),
+                        row=1, col=2)
+    figure.update_layout(height=700)
+
+    # Plot copula correlation 
+    asset_i = data.columns.get_loc(stock)
+    asset_names = data.columns.tolist()
+    stocks_indices = [i for i in range(num_stocks) if i != asset_i]
+    fig = make_subplots(
+            rows=1, cols=num_stocks-1,
+            subplot_titles=[f'{asset_names[asset_i]} vs {asset_names[i]}' for i in stocks_indices])
+    for j, asset_j in enumerate(stocks_indices):
+        u1, u2 = uniform_data[:, asset_i], uniform_data[:, asset_j]
+        lower_tail = (u1 <= 0.1) & (u2 <= 0.1)
+        upper_tail = (u1 >= 0.9) & (u2 >= 0.9)
+        normal_region = ~(lower_tail | upper_tail)
+        
+        fig.add_trace(
+            go.Scatter(
+                x=u1[normal_region], y=u2[normal_region],
+                mode='markers',
+                marker=dict(size=3, color='gray', opacity=0.4),
+                hovertemplate=f'{asset_names[asset_i]}: %{{x:.3f}}<br>{asset_names[asset_j]}: %{{y:.3f}}<extra></extra>',
+            ),
+            row=1, col=j+1
+        )
+        
+        if np.any(lower_tail):
+            fig.add_trace(
+                go.Scatter(
+                    x=u1[lower_tail], y=u2[lower_tail],
+                    mode='markers',
+                    marker=dict(size=5, color='red', opacity=0.8),
+                    hovertemplate=f'{asset_names[asset_i]}: %{{x:.3f}}<br>{asset_names[asset_j]}: %{{y:.3f}}<extra></extra>'
+                ),
+                row=1, col=j+1
+            )
+        
+        if np.any(upper_tail):
+            fig.add_trace(
+                go.Scatter(
+                    x=u1[upper_tail], y=u2[upper_tail],
+                    mode='markers',
+                    marker=dict(size=5, color='blue', opacity=0.8),
+                    hovertemplate=f'{asset_names[asset_i]}: %{{x:.3f}}<br>{asset_names[asset_j]}: %{{y:.3f}}<extra></extra>'
+                ),
+                row=1, col=j+1
+            )
+    fig.update_layout(title_text = 'Copula Correlations',showlegend=False)
+   
+    stats = {'Expected Return': total_portfolio_returns.mean(),
+                'Volatility': total_portfolio_returns.std(),
+                'Probability of loss': (total_portfolio_returns < 0).sum()/num_simulations,
+                'VaR 95%': -np.percentile(total_portfolio_returns, 5),
+                'CVaR 95%': -np.mean(total_portfolio_returns[total_portfolio_returns <= np.percentile(total_portfolio_returns, 5)])}
+    
+    return stats, figure, fig
 
